@@ -6,51 +6,123 @@
 
 static void llama_null_log(ggml_log_level, const char*, void*) {}
 
+void printBanner() {
+    std::cout << "\n";
+    std::cout << "╔══════════════════════════════════════════════╗\n";
+    std::cout << "║       Milvus RAG — Local AI Assistant        ║\n";
+    std::cout << "║   llama.cpp + Milvus | Apple Metal (M1)      ║\n";
+    std::cout << "╚══════════════════════════════════════════════╝\n\n";
+}
+
+void ingestPhase(LocalInferenceEngine& embedEngine, MilvusRAGClient& milvusClient) {
+    std::cout << "── INGESTION MODE ──────────────────────────────\n";
+    std::cout << "Enter documents to add to the knowledge base.\n";
+    std::cout << "Type 'done' on a new line when finished.\n\n";
+
+    int docCount = 0;
+    while (true) {
+        std::cout << "Document " << (docCount + 1) << " > ";
+        std::string line, doc;
+
+        while (std::getline(std::cin, line)) {
+            if (line == "done") break;
+            if (!doc.empty()) doc += " ";
+            doc += line;
+        }
+
+        if (doc.empty()) break;
+
+        std::cout << "  [Embedding...] ";
+        std::vector<float> vec = embedEngine.getEmbedding(doc);
+        milvusClient.insertDocument(vec, doc);
+        docCount++;
+        std::cout << "stored. (" << docCount << " total)\n\n";
+
+        std::cout << "Add another document? (yes/done): ";
+        std::string choice;
+        std::getline(std::cin, choice);
+        if (choice != "yes" && choice != "y") break;
+        std::cout << "\n";
+    }
+
+    std::cout << "\n✓ Knowledge base ready with " << docCount << " document(s).\n";
+}
+
+void chatPhase(LocalInferenceEngine& embedEngine,
+               LocalInferenceEngine& llmEngine,
+               MilvusRAGClient& milvusClient) {
+    std::cout << "\n── CHAT MODE ───────────────────────────────────\n";
+    std::cout << "Ask questions about your documents.\n";
+    std::cout << "Type 'exit' or 'quit' to stop.\n\n";
+
+    while (true) {
+        std::cout << "You > ";
+        std::string query;
+        std::getline(std::cin, query);
+
+        if (query.empty()) continue;
+        if (query == "exit" || query == "quit") {
+            std::cout << "\nGoodbye!\n";
+            break;
+        }
+
+        // Search top-k matching documents
+        std::vector<float> queryVec = embedEngine.getEmbedding(query);
+        auto matches = milvusClient.searchTopK(queryVec, 3);
+
+        if (matches.empty()) {
+            std::cout << "AI  > No relevant context found in knowledge base.\n\n";
+            continue;
+        }
+
+        // Build context from top-k results
+        std::string context;
+        for (size_t i = 0; i < matches.size(); ++i) {
+            context += "[" + std::to_string(i + 1) + "] " + matches[i].textPayload + "\n";
+        }
+
+        std::cout << "\n  [Context score: " << matches[0].distance << "]\n";
+
+        // Llama 3 native chat template — prevents filler/separator output
+        std::string prompt =
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+            "You are a helpful assistant. Answer using only the context provided. "
+            "Be concise. Do not add separators or formatting.\n"
+            "<|eot_id|><|start_header_id|>user<|end_header_id|>\n"
+            "Context:\n" + context +
+            "\nQuestion: " + query +
+            "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n";
+
+        std::cout << "AI  > ";
+        std::string answer = llmEngine.generateResponse(prompt);
+        std::cout << answer << "\n\n";
+    }
+}
+
 int main() {
     llama_log_set(llama_null_log, nullptr);
+
+    printBanner();
 
     const int EMBEDDING_DIM = 384;
     const std::string milvusHost = "127.0.0.1";
     const int milvusPort = 19530;
-    const std::string knowledgeCollection = "enterprise_infrastructure_ledger";
+    const std::string collection = "rag_knowledge_base";
 
-    std::cout << "[System Init] Bootstrapping...\n";
-
+    std::cout << "[Loading embedding model...]\n";
     LocalInferenceEngine embedEngine("./models/all-MiniLM-L6-v2.gguf", true);
+
+    std::cout << "[Loading LLM...]\n";
     LocalInferenceEngine llmEngine("./models/llama-3-8b-instruct.gguf", false);
-    MilvusRAGClient milvusClient(milvusHost, milvusPort, knowledgeCollection, EMBEDDING_DIM);
+
+    std::cout << "[Connecting to Milvus...]\n";
+    MilvusRAGClient milvusClient(milvusHost, milvusPort, collection, EMBEDDING_DIM);
     milvusClient.prepareCollection();
 
-    std::string doc =
-        "Security Directive: API access tokens for production servers must be rotated "
-        "every 48 hours. Vault backend server clusters are isolated on subnet 10.240.4.0/24.";
+    std::cout << "✓ All systems ready.\n\n";
 
-    std::cout << "[Ingestion] Embedding document...\n";
-    std::vector<float> docVec = embedEngine.getEmbedding(doc);
-    milvusClient.insertDocument(docVec, doc);
-    std::cout << "[Ingestion Success]\n";
-
-    std::string query = "What is the mandatory rotation window interval for API tokens?";
-    std::cout << "\n[Query]: " << query << "\n";
-
-    std::vector<float> queryVec = embedEngine.getEmbedding(query);
-    auto matches = milvusClient.searchTopK(queryVec, 1);
-
-    if (!matches.empty()) {
-        std::string ctx = matches[0].textPayload;
-        std::cout << "[Context (score=" << matches[0].distance << ")]: " << ctx << "\n";
-
-        std::string prompt =
-            "Context: " + ctx + "\n" +
-            "Question: " + query + "\n" +
-            "Answer concisely using only the context above.\nAnswer: ";
-
-        std::cout << "[Running inference...]\n";
-        std::string answer = llmEngine.generateResponse(prompt);
-        std::cout << "\n[Answer]:\n" << answer << "\n";
-    } else {
-        std::cerr << "[Error] No matches found in Milvus.\n";
-    }
+    ingestPhase(embedEngine, milvusClient);
+    chatPhase(embedEngine, llmEngine, milvusClient);
 
     return 0;
 }
